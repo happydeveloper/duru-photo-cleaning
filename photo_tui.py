@@ -1,6 +1,32 @@
 #!/usr/bin/env python3
 """
-photo_tui.py - macOS 사진 파일 정리 TUI
+photo_tui.py — macOS 사진 파일 정리 TUI
+
+패널 기반 대화형 화면(TUI)으로 사진 파일을 정리합니다.
+Google Drive 백업 후 삭제하는 기능을 포함합니다.
+
+실행:
+    python3 photo_tui.py
+
+화면 구성:
+    - 스캔 결과 테이블 (번호, 항목명, 크기, 경로)
+    - 로그 패널 (실시간 진행 메시지)
+    - 상태 바 (현재 작업 상태 한 줄)
+    - 명령 입력창 (하단)
+
+주요 명령:
+    scan              사진 파일 스캔 (시작 시 자동 실행)
+    delete <번호|all> 휴지통으로 이동 (Drive 인증 시 백업 여부 확인)
+    rm <번호|all>     완전 삭제 (Drive 인증 시 백업 여부 확인)
+    auth              Google Drive 인증
+    backup <번호|all> Drive 에 백업만
+    backup-delete     백업 후 휴지통 이동
+    backup-rm         백업 후 완전 삭제
+    help / F1         명령어 목록 표시
+    q / Ctrl+C        종료
+
+의존성:
+    pip3 install textual google-api-python-client google-auth-oauthlib google-auth-httplib2
 """
 
 import os
@@ -10,16 +36,24 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+# Textual: 파이썬용 TUI 프레임워크. 위젯 기반으로 패널 화면을 만듭니다.
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static
-from textual.reactive import reactive
+from textual.reactive import reactive  # 값이 바뀌면 화면을 자동으로 다시 그립니다.
 
-import gdrive_backup as gd
+import gdrive_backup as gd  # Google Drive 백업 모듈
 
-# ── 스캔 로직 ─────────────────────────────────────────────────────────────────
+
+# ---------------------------------------------------------------------------
+# 스캔 로직
+# ---------------------------------------------------------------------------
+# photo_cleaner.py 와 동일한 로직입니다.
+# TUI 에서 직접 임포트하지 않고 여기서 다시 정의한 이유는
+# photo_cleaner.py 가 시그널 핸들러와 커서 제어 코드를 포함하고 있어
+# TUI 와 충돌할 수 있기 때문입니다.
 
 HOME = Path.home()
 
@@ -54,6 +88,7 @@ IMAGE_EXTENSIONS = {
 
 
 def human(size: int) -> str:
+    """바이트 수를 "13.5 GB" 처럼 읽기 쉬운 문자열로 변환합니다."""
     for unit in ["B", "KB", "MB", "GB", "TB"]:
         if size < 1024:
             return f"{size:.1f} {unit}"
@@ -62,6 +97,12 @@ def human(size: int) -> str:
 
 
 def get_size_bytes(path: Path) -> int:
+    """디렉토리나 번들의 전체 크기를 바이트 단위로 반환합니다.
+
+    Python 의 os.path.getsize() 는 디렉토리 자체만 측정해 내용물을 포함하지 않습니다.
+    macOS 내장 du 명령으로 측정해야 실제 사용량이 나옵니다.
+    `du -sk` 는 킬로바이트 단위로 출력하므로 1024 를 곱해 바이트로 변환합니다.
+    """
     try:
         r = subprocess.run(["du", "-sk", str(path)],
                            capture_output=True, text=True, timeout=60)
@@ -73,6 +114,11 @@ def get_size_bytes(path: Path) -> int:
 
 
 def find_image_files(folder: Path) -> list[Path]:
+    """폴더를 재귀 탐색하여 이미지 파일 목록을 반환합니다.
+
+    PermissionError 는 조용히 무시합니다.
+    macOS 의 일부 시스템 폴더는 접근 권한이 없을 수 있기 때문입니다.
+    """
     files = []
     try:
         for p in folder.rglob("*"):
@@ -84,6 +130,14 @@ def find_image_files(folder: Path) -> list[Path]:
 
 
 def do_scan(on_progress=None) -> list[dict]:
+    """SCAN_TARGETS 를 순서대로 탐색하고 결과 dict 목록을 반환합니다.
+
+    각 항목의 처리 방식:
+    - pattern=None  : parent 안의 이미지 파일을 직접 수집 (file_list=True)
+    - pattern=*.xxx : parent.glob(pattern) 으로 번들/폴더를 찾음 (file_list=False)
+
+    on_progress: 진행 상황 콜백. 시그니처: (현재번호, 전체수, 항목이름)
+    """
     results = []
     total = len(SCAN_TARGETS)
     for idx, (label, desc, parent, pattern) in enumerate(SCAN_TARGETS, 1):
@@ -91,7 +145,10 @@ def do_scan(on_progress=None) -> list[dict]:
             on_progress(idx, total, label)
         if not parent.exists():
             continue
+
         if pattern is None:
+            # "사진 원본 파일" 항목: ~/Pictures 안의 이미지 파일을 직접 수집합니다.
+            # Photos Library 번들(.photoslibrary, .iPhoto) 은 이미 별도 항목으로 처리하므로 건너뜁니다.
             items = []
             try:
                 for child in parent.iterdir():
@@ -108,6 +165,7 @@ def do_scan(on_progress=None) -> list[dict]:
                 results.append({"label": label, "desc": desc,
                                  "paths": items, "size": size, "file_list": True})
         else:
+            # Photos Library 나 캐시 폴더처럼 glob 패턴으로 찾는 항목입니다.
             found = sorted(parent.glob(pattern))
             for path in found:
                 size = get_size_bytes(path)
@@ -117,6 +175,11 @@ def do_scan(on_progress=None) -> list[dict]:
 
 
 def move_to_trash(path: Path) -> bool:
+    """Finder AppleScript 를 통해 파일/폴더를 휴지통으로 이동합니다.
+
+    Python 의 send2trash 라이브러리 없이 macOS 네이티브 방식으로 처리합니다.
+    반환값: 성공이면 True, 실패(Finder 없음 등)이면 False.
+    """
     r = subprocess.run(
         ["osascript", "-e", f'tell app "Finder" to delete POSIX file "{path}"'],
         capture_output=True, text=True,
@@ -125,6 +188,11 @@ def move_to_trash(path: Path) -> bool:
 
 
 def permanent_delete(path: Path) -> bool:
+    """파일이나 폴더를 휴지통 없이 즉시 삭제합니다 (복구 불가).
+
+    디렉토리는 shutil.rmtree 로, 파일은 Path.unlink 로 삭제합니다.
+    예외가 발생하면 False 를 반환합니다.
+    """
     try:
         if path.is_dir():
             shutil.rmtree(path)
@@ -135,14 +203,19 @@ def permanent_delete(path: Path) -> bool:
         return False
 
 
-# ── 로거 ──────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# 로거
+# ---------------------------------------------------------------------------
 
 LOG_DIR = HOME / "Library" / "Logs" / "photo_cleaner"
 
 
 def setup_logger() -> Path:
+    """로그 파일을 생성하고 Python logging 을 설정합니다.
+    파일명에 PID 를 포함해 동시 실행 시 로그가 섞이지 않습니다.
+    """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = LOG_DIR / f"photo_cleaner_{ts}_{os.getpid()}.log"
     logging.basicConfig(
         level=logging.INFO,
@@ -153,8 +226,12 @@ def setup_logger() -> Path:
     return log_path
 
 
-# ── TUI ───────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# TUI 앱
+# ---------------------------------------------------------------------------
 
+# RichLog 에 출력할 도움말 텍스트입니다.
+# [bold cyan]...[/] 같은 태그는 Textual 의 Rich 마크업 문법입니다.
 HELP_TEXT = """\
 [bold cyan]사용 가능한 명령어[/]
 
@@ -175,6 +252,11 @@ HELP_TEXT = """\
 
 
 class StatusBar(Static):
+    """화면 하단에 현재 상태를 한 줄로 표시하는 위젯입니다.
+
+    `status` 는 reactive 변수입니다.
+    값이 바뀌면 Textual 이 자동으로 render() 를 다시 호출해 화면을 갱신합니다.
+    """
     status = reactive("준비")
 
     def render(self) -> str:
@@ -182,6 +264,15 @@ class StatusBar(Static):
 
 
 class PhotoTUI(App):
+    """사진 파일 정리 TUI 앱의 메인 클래스입니다.
+
+    Textual 의 App 을 상속합니다.
+    compose() 에서 위젯을 배치하고, on_mount() 에서 초기화를 수행합니다.
+    """
+
+    # CSS 는 위젯의 크기와 색상을 지정합니다.
+    # $panel, $accent 같은 변수는 Textual 의 기본 테마 색상입니다.
+    # height: 1fr 은 "남은 공간을 모두 차지"한다는 뜻입니다.
     CSS = """
     Screen { layout: vertical; }
 
@@ -215,6 +306,8 @@ class PhotoTUI(App):
     }
     """
 
+    # 키보드 단축키 바인딩입니다.
+    # Footer 위젯이 이 목록을 읽어 화면 하단에 단축키 힌트를 표시합니다.
     BINDINGS = [
         Binding("ctrl+c", "quit",  "종료"),
         Binding("ctrl+r", "scan",  "재스캔"),
@@ -223,17 +316,34 @@ class PhotoTUI(App):
 
     def __init__(self):
         super().__init__()
+        # 스캔 결과를 저장합니다. 각 원소는 result dict (ARCHITECTURE.md 참고).
         self._results: list[dict] = []
+
+        # 동시 실행 방지 플래그입니다.
+        # _scanning: 스캔이 이미 돌고 있을 때 "scan" 명령을 또 입력하면 무시합니다.
+        # _busy: 백업이나 삭제가 진행 중일 때 새 작업 시작을 막습니다.
         self._scanning  = False
-        self._busy      = False          # 백업/삭제 진행 중 플래그
-        self._creds     = None           # Google OAuth 자격증명
+        self._busy      = False
+
+        # Google OAuth 자격증명입니다. None 이면 Drive 기능을 쓸 수 없습니다.
+        self._creds     = None
+
         self._log_path  = setup_logger()
-        # 삭제 전 백업 확인 대기 상태: (items, permanent) 또는 None
+
+        # 삭제 전 백업 여부 확인 대기 상태입니다.
+        # None: 대기 중이 아님
+        # (items, permanent): y/n/c 응답을 기다리는 중
+        # on_input_submitted 에서 이 값이 있으면 명령 처리보다 먼저 응답 처리를 합니다.
         self._pending_delete: tuple | None = None
 
     # ── 레이아웃 ──────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
+        """화면에 배치할 위젯을 위에서 아래 순서로 yield 합니다.
+
+        Textual 은 이 메서드를 호출해 위젯 트리를 구성합니다.
+        CSS 의 `layout: vertical` 이 위젯을 위아래로 쌓아줍니다.
+        """
         yield Header(show_clock=True)
         with Vertical():
             yield Label(" [bold]스캔 결과[/]", id="table-label", markup=True)
@@ -249,12 +359,24 @@ class PhotoTUI(App):
         yield Footer()
 
     def on_mount(self) -> None:
+        """앱이 처음 열릴 때 한 번 실행됩니다.
+
+        위젯이 모두 생성된 뒤 호출되므로 여기서 위젯에 접근해 초기화합니다.
+        """
         self.title = "macOS 사진 파일 정리"
+
+        # DataTable 에 컬럼 헤더를 추가합니다.
         table = self.query_one("#result-table", DataTable)
         table.add_columns("번호", "항목", "크기", "경로/파일 수")
+
+        # 입력창에 포커스를 줍니다.
+        # DataTable 이 기본 포커스를 받으면 키 입력이 DataTable 에만 전달됩니다.
+        # on_mount 에서 명시적으로 Input 에 포커스를 줘야 명령 입력이 바로 됩니다.
         self.query_one("#cmd-input", Input).focus()
         self._log(f"로그 파일: {self._log_path}")
 
+        # 이전 세션에서 저장된 token.json 이 있으면 자동으로 Drive 인증을 시도합니다.
+        # 없으면 사용자에게 auth 명령 안내 메시지를 표시합니다.
         if gd.token_exists():
             try:
                 self._creds = gd.authenticate()
@@ -269,18 +391,26 @@ class PhotoTUI(App):
                 f"{gd.CREDS_FILE} 에 credentials.json 를 저장하세요[/]"
             )
 
+        # 앱이 열리자마자 자동으로 스캔을 시작합니다.
         self.action_scan()
 
     # ── 명령 파싱 ─────────────────────────────────────────────────────────────
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        """사용자가 Enter 를 누를 때마다 호출됩니다.
+
+        _pending_delete 가 있으면 명령이 아니라 y/n/c 응답으로 처리합니다.
+        그렇지 않으면 _dispatch 로 명령을 파싱합니다.
+        이 순서가 중요합니다: 백업 확인 대기 중에 "scan" 을 입력하면
+        스캔이 시작되는 것이 아니라 "올바른 응답이 아닙니다" 메시지가 나와야 합니다.
+        """
         raw = event.value.strip()
         self.query_one("#cmd-input", Input).clear()
         if not raw:
             return
         self._log(f"[dim]> {raw}[/]")
 
-        # 백업 여부 대기 중이면 응답 처리
+        # 백업 여부 대기 중이면 응답 처리를 먼저 합니다.
         if self._pending_delete is not None:
             self._handle_backup_confirm(raw)
             return
@@ -288,6 +418,12 @@ class PhotoTUI(App):
         self._dispatch(raw)
 
     def _dispatch(self, raw: str) -> None:
+        """입력 문자열을 파싱해 해당 동작을 실행합니다.
+
+        Python 3.10+ 의 match 문으로 명령을 라우팅합니다.
+        `case "delete" if arg:` 처럼 가드 조건을 붙일 수 있습니다.
+        인자 없이 "delete" 만 입력하면 case _ 로 떨어져 도움말을 안내합니다.
+        """
         parts = raw.lower().split()
         cmd   = parts[0] if parts else ""
         arg   = parts[1] if len(parts) >= 2 else None
@@ -317,6 +453,10 @@ class PhotoTUI(App):
                 self._log(f"[red]알 수 없는 명령:[/] {raw}  (F1: 도움말)")
 
     def _guard_busy(self, fn) -> None:
+        """_busy 가 True 이면 fn 실행을 막고 경고 메시지를 표시합니다.
+
+        백업/삭제 중에 또 다른 작업이 시작되면 파일 상태가 꼬일 수 있습니다.
+        """
         if self._busy:
             self._log("[yellow]다른 작업이 진행 중입니다. 잠시 기다려주세요.[/]")
             return
@@ -325,6 +465,11 @@ class PhotoTUI(App):
     # ── 스캔 ──────────────────────────────────────────────────────────────────
 
     def action_scan(self) -> None:
+        """스캔을 시작합니다. BINDINGS 의 Ctrl+R 과 "scan" 명령 모두 여기로 옵니다.
+
+        _scanning 플래그로 중복 실행을 막습니다.
+        실제 스캔은 _run_scan 워커 스레드에서 실행합니다.
+        """
         if self._scanning:
             self._log("[yellow]이미 스캔 중입니다.[/]")
             return
@@ -336,7 +481,14 @@ class PhotoTUI(App):
 
     @work(thread=True)
     def _run_scan(self) -> None:
+        """백그라운드 스레드에서 실제 파일 시스템 스캔을 수행합니다.
+
+        @work(thread=True): Textual 이 이 메서드를 자동으로 새 스레드에서 실행합니다.
+        UI 업데이트는 call_from_thread() 로 메인 스레드에 위임합니다.
+        스레드 안에서 직접 위젯에 접근하면 충돌이 발생합니다.
+        """
         def progress(idx, total, label):
+            # 스레드 안이므로 UI 접근은 call_from_thread 를 통해서만 합니다.
             self.call_from_thread(
                 self._set_status, f"스캔 중... [{idx}/{total}] {label}"
             )
@@ -344,6 +496,10 @@ class PhotoTUI(App):
         self.call_from_thread(self._on_scan_done, results)
 
     def _on_scan_done(self, results: list[dict]) -> None:
+        """스캔 완료 시 메인 스레드에서 호출됩니다 (call_from_thread 경유).
+
+        결과를 _results 에 저장하고 테이블과 상태바를 업데이트합니다.
+        """
         self._scanning = False
         self._results  = results
         total = sum(r["size"] for r in results)
@@ -353,6 +509,11 @@ class PhotoTUI(App):
         logging.info(f"스캔 완료: {len(results)}개 항목, {human(total)}")
 
     def _show_results(self) -> None:
+        """_results 를 DataTable 에 다시 렌더링합니다.
+
+        100MB 이상 항목은 노란색으로 강조해 주의를 끕니다.
+        file_list=True 항목은 파일 개수를, False 항목은 경로를 표시합니다.
+        """
         table = self.query_one("#result-table", DataTable)
         table.clear()
         if not self._results:

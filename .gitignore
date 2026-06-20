@@ -8,3 +8,8 @@ credentials.json
 
 # macOS
 .DS_Store
+
+# PyInstaller
+build/
+dist/
+*.spec
