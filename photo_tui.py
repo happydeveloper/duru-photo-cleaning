@@ -242,8 +242,10 @@ HELP_TEXT = """\
   [yellow]scan[/]                    사진 파일 스캔 (시작 시 자동 실행)
   [yellow]list[/]                    스캔 결과 다시 표시
 
-  [yellow]delete <번호|all>[/]       휴지통으로 이동
-  [yellow]rm <번호|all>[/]           완전 삭제 (복구 불가)
+  [yellow]delete[/]                  전체 휴지통 이동
+  [yellow]delete <번호>[/]           해당 번호 휴지통 이동
+  [yellow]rm[/]                      전체 완전 삭제 (복구 불가)
+  [yellow]rm <번호>[/]               해당 번호 완전 삭제 (복구 불가)
 
   [yellow]auth[/]                    Google Drive OAuth 인증
   [yellow]backup <번호|all>[/]       Google Drive 에 백업
@@ -258,13 +260,24 @@ HELP_TEXT = """\
 class ResultTable(DataTable):
     """스캔 결과를 표시하는 DataTable 서브클래스입니다.
 
-    Space/Delete 단축키를 여기에 정의해 DataTable 에 포커스가 있을 때만 작동합니다.
-    App 레벨 BINDINGS 에 두면 Input 에 포커스가 있어도 키를 가로채기 때문입니다.
+    BINDINGS 대신 on_key 를 사용하는 이유:
+    BINDINGS 는 Textual 이 전역적으로 검사하므로, 다른 위젯(Input)에 포커스가
+    있어도 키를 가로챌 수 있습니다. on_key 는 이 위젯에 포커스가 있을 때만
+    호출되므로 Input 의 키 입력과 충돌하지 않습니다.
     """
-    BINDINGS = [
-        Binding("space",  "app.row_trash",  "선택→휴지통"),
-        Binding("delete", "app.row_remove", "선택→완전삭제"),
-    ]
+
+    def on_key(self, event) -> None:
+        """ResultTable 에 포커스가 있을 때만 호출됩니다."""
+        if event.key == "space":
+            # Space → 선택 행 휴지통 이동
+            self.app.action_row_trash()
+            event.stop()
+        elif event.key in ("delete", "backspace"):
+            # Delete/Backspace → 선택 행 완전 삭제
+            # "delete" 는 DEL(0x7F), "backspace" 는 BS(0x08).
+            # Mac 키보드 설정에 따라 물리적 Delete 키가 둘 중 하나로 전달됩니다.
+            self.app.action_row_remove()
+            event.stop()
 
 
 class StatusBar(Static):
@@ -461,10 +474,13 @@ class PhotoTUI(App):
                 self.action_help()
             case "auth":
                 self._do_auth()
-            case "delete" if arg:
-                self._guard_busy(lambda: self._do_delete(arg, permanent=False))
-            case "rm" if arg:
-                self._guard_busy(lambda: self._do_delete(arg, permanent=True))
+            case "delete":
+                # 번호 없이 "delete" 만 입력하면 전체(all) 를 대상으로 합니다.
+                target = arg if arg else "all"
+                self._guard_busy(lambda: self._do_delete(target, permanent=False))
+            case "rm":
+                target = arg if arg else "all"
+                self._guard_busy(lambda: self._do_delete(target, permanent=True))
             case "backup" if arg:
                 self._guard_busy(lambda: self._do_backup(arg, after=None))
             case "backup-delete" if arg:
