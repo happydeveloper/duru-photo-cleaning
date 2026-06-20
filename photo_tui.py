@@ -29,12 +29,16 @@ Google Drive 백업 후 삭제하는 기능을 포함합니다.
     pip3 install textual google-api-python-client google-auth-oauthlib google-auth-httplib2
 """
 
+import json
 import os
 import shutil
 import subprocess
+import sys
 import logging
 from datetime import datetime
 from pathlib import Path
+
+_MB_FILE = Path("/tmp/photo_cleaner_mb.json")
 
 # Textual: 파이썬용 TUI 프레임워크. 위젯 기반으로 패널 화면을 만듭니다.
 from textual import work
@@ -336,6 +340,10 @@ class PhotoTUI(App):
         # on_input_submitted 에서 이 값이 있으면 명령 처리보다 먼저 응답 처리를 합니다.
         self._pending_delete: tuple | None = None
 
+        # 메뉴바 헬퍼 프로세스
+        self._mb_proc: subprocess.Popen | None = None
+        self._mb_nid  = 0   # 알림 ID 카운터
+
     # ── 레이아웃 ──────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
@@ -374,6 +382,7 @@ class PhotoTUI(App):
         # on_mount 에서 명시적으로 Input 에 포커스를 줘야 명령 입력이 바로 됩니다.
         self.query_one("#cmd-input", Input).focus()
         self._log(f"로그 파일: {self._log_path}")
+        self._start_menubar()
 
         # 이전 세션에서 저장된 token.json 이 있으면 자동으로 Drive 인증을 시도합니다.
         # 없으면 사용자에게 auth 명령 안내 메시지를 표시합니다.
@@ -477,6 +486,7 @@ class PhotoTUI(App):
         self._set_status("스캔 중...")
         self._log("[cyan]스캔 시작...[/]")
         logging.info("스캔 시작")
+        self._mb("scan", "스캔 시작")
         self._run_scan()
 
     @work(thread=True)
@@ -492,6 +502,7 @@ class PhotoTUI(App):
             self.call_from_thread(
                 self._set_status, f"스캔 중... [{idx}/{total}] {label}"
             )
+            self._mb("scan", f"{idx}/{total}", pct=idx / total * 100)
         results = do_scan(on_progress=progress)
         self.call_from_thread(self._on_scan_done, results)
 
@@ -507,6 +518,7 @@ class PhotoTUI(App):
         self._log(f"[green]스캔 완료[/] - {len(results)}개 항목, 합계 [bold]{human(total)}[/]")
         self._set_status(f"스캔 완료  |  {len(results)}개 항목  |  합계 {human(total)}")
         logging.info(f"스캔 완료: {len(results)}개 항목, {human(total)}")
+        self._mb("idle")
 
     def _show_results(self) -> None:
         """_results 를 DataTable 에 다시 렌더링합니다.
@@ -531,6 +543,12 @@ class PhotoTUI(App):
     # ── Google Drive 인증 ──────────────────────────────────────────────────────
 
     def _do_auth(self) -> None:
+        """"auth" 명령 처리: credentials.json 확인 후 OAuth 흐름을 시작합니다.
+
+        credentials.json 이 없으면 설정 방법을 안내하고 중단합니다.
+        있으면 _run_auth 워커를 시작합니다. 브라우저가 열리고 로그인 후
+        token.json 이 자동 저장됩니다.
+        """
         if not gd.credentials_exist():
             self._log(
                 f"[red]credentials.json 없음[/]\n"
@@ -544,6 +562,11 @@ class PhotoTUI(App):
 
     @work(thread=True)
     def _run_auth(self) -> None:
+        """백그라운드 스레드에서 OAuth 인증을 수행합니다.
+
+        gd.authenticate() 는 내부적으로 브라우저를 열고 콜백 서버를 기다립니다.
+        이 과정이 UI 를 블로킹하지 않도록 스레드에서 실행합니다.
+        """
         try:
             creds = gd.authenticate()
             self.call_from_thread(self._on_auth_done, creds, None)
@@ -551,6 +574,7 @@ class PhotoTUI(App):
             self.call_from_thread(self._on_auth_done, None, str(e))
 
     def _on_auth_done(self, creds, error: str | None) -> None:
+        """인증 완료 시 메인 스레드에서 호출됩니다 (call_from_thread 경유)."""
         if error:
             self._log(f"[red]인증 실패:[/] {error}")
             self._set_status("Google Drive 인증 실패")
@@ -564,6 +588,16 @@ class PhotoTUI(App):
     # ── 백업 ──────────────────────────────────────────────────────────────────
 
     def _do_backup(self, target: str, after: str | None) -> None:
+        """"backup" / "backup-delete" / "backup-rm" 명령 처리.
+
+        after 값으로 백업 완료 후 동작을 결정합니다.
+        - None      : 백업만 (삭제 없음)
+        - "trash"   : 백업 후 휴지통 이동
+        - "permanent": 백업 후 완전 삭제
+
+        항목에서 백업 가능한 이미지 파일을 미리 추출해 없으면 조기 종료합니다.
+        캐시/메타데이터 항목은 이미지가 없으므로 이 단계에서 걸러집니다.
+        """
         if not self._results:
             self._log("[yellow]먼저 scan 명령으로 스캔하세요.[/]")
             return
@@ -575,7 +609,8 @@ class PhotoTUI(App):
         if items is None:
             return
 
-        # 백업할 이미지 파일 미리 계산
+        # 선택된 항목에서 업로드할 이미지 파일을 미리 수집합니다.
+        # 중복 경로 제거: 같은 파일이 두 항목에 포함될 경우 한 번만 업로드합니다.
         all_images: list[Path] = []
         for _, r in items:
             all_images.extend(gd.collect_images(r))
@@ -594,6 +629,7 @@ class PhotoTUI(App):
         )
         logging.info(f"Drive 백업 시작: {len(unique)}개 파일, after={after}")
         self._set_status(f"Drive 백업 중... 0/{len(unique)}")
+        self._mb("backup", f"0/{len(unique)}")
         self._busy = True
         self._run_backup(items, unique, after)
 
@@ -604,6 +640,16 @@ class PhotoTUI(App):
         unique: list[Path],
         after: str | None,
     ) -> None:
+        """백그라운드 스레드에서 Drive 업로드를 실행합니다.
+
+        gd.BackupSession 에 콜백 함수를 전달해 진행 상황을 UI 에 알립니다.
+        모든 UI 업데이트는 call_from_thread() 를 통해 메인 스레드로 위임합니다.
+
+        on_file: 파일 하나가 시작될 때 상태 바와 로그를 업데이트합니다.
+        on_progress: 4MB 청크가 전송될 때마다 ASCII 진행 바를 그립니다.
+        on_done: 전체 완료 후 _on_backup_done 을 메인 스레드에서 호출합니다.
+        on_error: 파일 하나가 실패하면 로그에 빨간색으로 표시합니다.
+        """
         date_str  = datetime.now().strftime("%Y-%m-%d")
         total     = len(unique)
         success   = 0
@@ -616,9 +662,11 @@ class PhotoTUI(App):
             self.call_from_thread(
                 self._log, f"  [{idx}/{_total}] {name}"
             )
+            self._mb("backup", f"{idx}/{_total}", pct=idx / _total * 100)
 
         def on_progress(uploaded, total_bytes, name):
             if total_bytes:
+                # ASCII 진행 바: "#" 는 완료, "." 는 미완료 (총 20칸)
                 pct = int(uploaded / total_bytes * 100)
                 bar = "#" * (pct // 5) + "." * (20 - pct // 5)
                 self.call_from_thread(
@@ -629,6 +677,7 @@ class PhotoTUI(App):
         def on_done(_success, _fail, folder_url):
             nonlocal success, fail
             success, fail = _success, _fail
+            # BackupSession 내부에서 호출되므로 스레드 안 — call_from_thread 필수
             self.call_from_thread(
                 self._on_backup_done, success, fail, folder_url, items, after
             )
@@ -636,6 +685,7 @@ class PhotoTUI(App):
         def on_error(name, msg):
             nonlocal fail
             fail += 1
+            # name 이 빈 문자열이면 세션 전체 오류 (gdrive_backup.py 규약)
             label = f"[red]업로드 실패[/]: {name} - {msg}" if name else f"[red]오류[/]: {msg}"
             self.call_from_thread(self._log, label)
             logging.error(f"UPLOAD FAIL {name}: {msg}")
@@ -658,13 +708,30 @@ class PhotoTUI(App):
         items: list[tuple],
         after: str | None,
     ) -> None:
+        """백업 완료 후 메인 스레드에서 실행됩니다 (call_from_thread 경유).
+
+        after 가 있으면 삭제 워커를 연이어 시작합니다.
+        성공한 파일이 하나도 없으면 삭제를 건너뜁니다 (실패 파일을 삭제하면 안 됨).
+        """
         self._busy = False
 
         if fail == 0:
             self._log(f"[bold green]백업 완료[/] - {success}개 파일 업로드 성공")
+            self._mb(
+                "done", f"{success}개 업로드 완료",
+                notify=True,
+                n_title="📷 Google Drive 백업 완료",
+                n_body=f"{success}개 파일 업로드 성공",
+            )
         else:
             self._log(
                 f"[yellow]백업 부분 완료[/] - 성공 {success}개 / 실패 {fail}개"
+            )
+            self._mb(
+                "done", f"성공 {success} / 실패 {fail}",
+                notify=True,
+                n_title="📷 백업 완료 (일부 실패)",
+                n_body=f"성공 {success}개 / 실패 {fail}개",
             )
         self._log(f"  Drive 폴더: [link={folder_url}]{folder_url}[/link]")
         logging.info(f"Drive 백업 완료: 성공 {success} / 실패 {fail}")
@@ -681,6 +748,12 @@ class PhotoTUI(App):
     # ── 삭제 ──────────────────────────────────────────────────────────────────
 
     def _do_delete(self, target: str, permanent: bool) -> None:
+        """"delete" 또는 "rm" 명령 처리.
+
+        Drive 인증이 되어 있으면 _pending_delete 에 작업을 저장하고
+        y/n/c 응답을 기다립니다.
+        인증이 없으면 바로 _start_delete 를 호출합니다.
+        """
         if not self._results:
             self._log("[yellow]먼저 scan 명령으로 스캔하세요.[/]")
             return
@@ -707,7 +780,12 @@ class PhotoTUI(App):
         self._start_delete(items, permanent)
 
     def _handle_backup_confirm(self, raw: str) -> None:
-        """백업 여부 확인 응답 처리."""
+        """y/n/c 응답을 처리합니다.
+
+        _pending_delete 를 None 으로 먼저 초기화해 응답 처리 중
+        또 다른 Enter 가 들어와도 재진입하지 않습니다.
+        잘못된 입력이면 다시 _pending_delete 를 복원해 계속 대기합니다.
+        """
         pending = self._pending_delete
         self._pending_delete = None
         self._set_status("")
@@ -734,7 +812,11 @@ class PhotoTUI(App):
             self._set_status("백업 여부 확인 중 (y/n/c)")
 
     def _do_backup_from_items(self, items: list[tuple], after: str) -> None:
-        """items 가 이미 결정된 상태에서 바로 백업 진행."""
+        """_handle_backup_confirm 에서 "y" 를 선택했을 때 호출됩니다.
+
+        _do_backup 과 달리 target 문자열 파싱 없이 items 가 이미 결정된 상태입니다.
+        백업할 이미지가 없으면 (캐시 항목만 선택) 바로 삭제로 넘어갑니다.
+        """
         all_images: list[Path] = []
         for _, r in items:
             all_images.extend(gd.collect_images(r))
@@ -757,15 +839,26 @@ class PhotoTUI(App):
         self._run_backup(items, unique, after)
 
     def _start_delete(self, items: list[tuple], permanent: bool) -> None:
+        """삭제 워커를 시작하기 전 로그/상태 메시지를 출력하고 _busy 를 설정합니다."""
         mode_str = "완전 삭제" if permanent else "휴지통 이동"
         self._log(f"[cyan]{mode_str} 시작 - {len(items)}개 항목[/]")
         logging.info(f"{mode_str} 시작: {len(items)}개 항목")
         self._set_status(f"{mode_str} 중...")
+        self._mb("delete", f"{len(items)}개 항목")
         self._busy = True
         self._run_delete(items, permanent)
 
     @work(thread=True)
     def _run_delete(self, items: list[tuple], permanent: bool) -> None:
+        """백그라운드 스레드에서 파일/폴더를 삭제합니다.
+
+        각 항목의 paths 를 순서대로 처리합니다.
+        file_list=True 인 항목은 paths 에 파일이 여러 개이므로 하나씩 삭제합니다.
+        file_list=False 인 항목은 paths[0] 하나만 있습니다.
+
+        삭제 후 _results 에서 처리된 번호를 제거합니다.
+        이렇게 해야 다음 list/scan 없이도 테이블이 최신 상태를 반영합니다.
+        """
         action   = permanent_delete if permanent else move_to_trash
         mode_str = "완전 삭제" if permanent else "휴지통 이동"
         freed    = 0
@@ -790,6 +883,8 @@ class PhotoTUI(App):
             )
             logging.info(f"DONE [{num}] {r['label']}: {ok}/{len(r['paths'])}개")
 
+        # 삭제한 항목을 _results 에서 제거합니다.
+        # enumerate 기준 번호(1-indexed)와 items 의 num 을 비교합니다.
         deleted_nums = {str(num) for num, _ in items}
         self._results = [
             r for i, r in enumerate(self._results, 1)
@@ -798,6 +893,11 @@ class PhotoTUI(App):
         self.call_from_thread(self._on_delete_done, freed, mode_str)
 
     def _on_delete_done(self, freed: int, mode_str: str) -> None:
+        """삭제 완료 후 메인 스레드에서 실행됩니다 (call_from_thread 경유).
+
+        휴지통 이동의 경우 "휴지통 비우기가 필요합니다" 안내를 추가합니다.
+        실제 디스크 공간은 휴지통을 비워야 확보됩니다.
+        """
         self._busy = False
         self._show_results()
         remaining = sum(r["size"] for r in self._results)
@@ -811,10 +911,22 @@ class PhotoTUI(App):
         suffix = "  (* 휴지통 비우기 필요)" if mode_str == "휴지통 이동" else ""
         self._set_status(f"{mode_str} 완료 - {human(freed)} 확보{suffix}")
         logging.info(f"{mode_str} 완료: {human(freed)} 확보")
+        self._mb(
+            "done", f"{human(freed)} 확보",
+            notify=True,
+            n_title=f"📷 {mode_str} 완료",
+            n_body=f"{human(freed)} 확보{suffix}",
+        )
 
     # ── 공통 헬퍼 ─────────────────────────────────────────────────────────────
 
     def _resolve_target(self, target: str) -> list[tuple] | None:
+        """"all" 또는 번호 문자열을 (번호, result_dict) 튜플 목록으로 변환합니다.
+
+        반환 형태: [(1, r1), (3, r3), ...]
+        번호는 1-indexed 로 DataTable 표시 번호와 일치합니다.
+        잘못된 입력이면 로그에 오류를 표시하고 None 을 반환합니다.
+        """
         if target == "all":
             return list(enumerate(self._results, 1))
         try:
@@ -828,13 +940,77 @@ class PhotoTUI(App):
             return None
 
     def action_help(self) -> None:
+        """F1 키 및 "help" 명령 처리: HELP_TEXT 를 로그 패널에 출력합니다."""
         self.query_one("#log", RichLog).write(HELP_TEXT)
 
     def _log(self, msg: str) -> None:
+        """RichLog 위젯에 한 줄을 추가합니다. Rich 마크업 태그를 지원합니다."""
         self.query_one("#log", RichLog).write(msg)
 
     def _set_status(self, msg: str) -> None:
+        """StatusBar 의 reactive 변수를 업데이트합니다. 화면이 자동으로 갱신됩니다."""
         self.query_one("#status-bar", StatusBar).status = msg
+
+    # ── 메뉴바 헬퍼 ───────────────────────────────────────────────────────────
+
+    def _start_menubar(self) -> None:
+        """menubar_status.py 를 별도 프로세스로 띄웁니다.
+
+        이 파일이 없어도 TUI 는 정상 동작합니다 (선택적 기능).
+        """
+        script = Path(__file__).parent / "menubar_status.py"
+        if not script.exists():
+            return
+        try:
+            self._mb_proc = subprocess.Popen(
+                [sys.executable, str(script)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._mb("idle")
+            self._log("[dim]메뉴바 상태 표시기 시작됨[/]")
+        except Exception:
+            self._mb_proc = None
+
+    def _mb(
+        self,
+        state: str,
+        msg: str = "",
+        pct: float | None = None,
+        notify: bool = False,
+        n_title: str = "",
+        n_body: str = "",
+    ) -> None:
+        """메뉴바 상태 파일(_MB_FILE)을 JSON 으로 업데이트합니다.
+
+        menubar_status.py 프로세스가 이 파일을 주기적으로 읽어
+        macOS 메뉴 바에 진행 상황을 표시합니다.
+        파일 쓰기는 원자적이므로 스레드 안에서 호출해도 안전합니다.
+        _mb_proc 이 없어도 조용히 무시됩니다.
+        """
+        if notify:
+            self._mb_nid += 1
+        try:
+            _MB_FILE.write_text(json.dumps({
+                "state":     state,
+                "msg":       msg,
+                "pct":       pct,
+                "pid":       os.getpid(),
+                "notify_id": self._mb_nid,
+                "n_title":   n_title,
+                "n_body":    n_body or msg,
+            }))
+        except Exception:
+            pass
+
+    def on_unmount(self) -> None:
+        """앱 종료 시 메뉴바 프로세스와 임시 파일을 정리합니다."""
+        try:
+            _MB_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
+        if self._mb_proc and self._mb_proc.poll() is None:
+            self._mb_proc.terminate()
 
 
 if __name__ == "__main__":
