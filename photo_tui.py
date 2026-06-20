@@ -255,6 +255,18 @@ HELP_TEXT = """\
 """
 
 
+class ResultTable(DataTable):
+    """스캔 결과를 표시하는 DataTable 서브클래스입니다.
+
+    Space/Delete 단축키를 여기에 정의해 DataTable 에 포커스가 있을 때만 작동합니다.
+    App 레벨 BINDINGS 에 두면 Input 에 포커스가 있어도 키를 가로채기 때문입니다.
+    """
+    BINDINGS = [
+        Binding("space",  "app.row_trash",  "선택→휴지통"),
+        Binding("delete", "app.row_remove", "선택→완전삭제"),
+    ]
+
+
 class StatusBar(Static):
     """화면 하단에 현재 상태를 한 줄로 표시하는 위젯입니다.
 
@@ -355,12 +367,13 @@ class PhotoTUI(App):
         yield Header(show_clock=True)
         with Vertical():
             yield Label(" [bold]스캔 결과[/]", id="table-label", markup=True)
-            yield DataTable(id="result-table", cursor_type="row")
+            yield ResultTable(id="result-table", cursor_type="row")
             yield Label(" [bold]로그[/]", id="log-label", markup=True)
             yield RichLog(id="log", highlight=True, markup=True, wrap=True)
         yield StatusBar(id="status-bar")
         yield Label(
-            " 명령 입력  (F1: 도움말  Ctrl+R: 재스캔  Ctrl+C: 종료)",
+            " 명령 입력  (F1: 도움말  Ctrl+R: 재스캔  Ctrl+C: 종료)"
+            "  [dim]테이블 선택 후: Space=휴지통  Delete=완전삭제[/]",
             id="cmd-label", markup=True,
         )
         yield Input(placeholder="> 명령어를 입력하세요...", id="cmd-input")
@@ -373,8 +386,8 @@ class PhotoTUI(App):
         """
         self.title = "macOS 사진 파일 정리"
 
-        # DataTable 에 컬럼 헤더를 추가합니다.
-        table = self.query_one("#result-table", DataTable)
+        # ResultTable 에 컬럼 헤더를 추가합니다.
+        table = self.query_one("#result-table", ResultTable)
         table.add_columns("번호", "항목", "크기", "경로/파일 수")
 
         # 입력창에 포커스를 줍니다.
@@ -526,7 +539,7 @@ class PhotoTUI(App):
         100MB 이상 항목은 노란색으로 강조해 주의를 끕니다.
         file_list=True 항목은 파일 개수를, False 항목은 경로를 표시합니다.
         """
-        table = self.query_one("#result-table", DataTable)
+        table = self.query_one("#result-table", ResultTable)
         table.clear()
         if not self._results:
             self._log("[yellow]스캔 결과 없음 - scan 명령으로 스캔하세요[/]")
@@ -938,6 +951,25 @@ class PhotoTUI(App):
         except ValueError:
             self._log(f"[red]숫자 또는 all 을 입력하세요:[/] {target}")
             return None
+
+    def action_row_trash(self) -> None:
+        """DataTable 포커스 상태에서 Space 키 → 현재 행 휴지통 이동."""
+        self._delete_focused_row(permanent=False)
+
+    def action_row_remove(self) -> None:
+        """DataTable 포커스 상태에서 Delete 키 → 현재 행 완전 삭제."""
+        self._delete_focused_row(permanent=True)
+
+    def _delete_focused_row(self, permanent: bool) -> None:
+        table = self.query_one("#result-table", ResultTable)
+        if not table.has_focus or not self._results:
+            return
+        row = table.cursor_row
+        if not (0 <= row < len(self._results)):
+            return
+        self._guard_busy(lambda: self._do_delete(str(row + 1), permanent=permanent))
+        # y/n/c 응답 입력을 위해 Input 으로 포커스 이동
+        self.query_one("#cmd-input", Input).focus()
 
     def action_help(self) -> None:
         """F1 키 및 "help" 명령 처리: HELP_TEXT 를 로그 패널에 출력합니다."""
