@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Google OAuth 토큰 (민감 정보)
+token.json
+credentials.json
+
+# macOS
+.DS_Store
